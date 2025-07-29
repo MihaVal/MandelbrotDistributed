@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.Scanner;
 import javax.imageio.ImageIO;
+import mpi.*;
 
 public class MandelbrotViewer extends JFrame {
     private int width = 800;
@@ -214,6 +215,9 @@ public class MandelbrotViewer extends JFrame {
 
     public static void main(String[] args) {
 
+        MPI.Init(args);
+        int rank = MPI.COMM_WORLD.Rank();
+        int size = MPI.COMM_WORLD.Size();
 
         SwingUtilities.invokeLater(() -> {
             for (String arg : args) {
