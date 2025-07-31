@@ -2,6 +2,11 @@ import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import javax.imageio.ImageIO;
 import mpi.*;
 
 public class MandelbrotViewer extends JFrame {
@@ -13,7 +18,7 @@ public class MandelbrotViewer extends JFrame {
     private double yMin = -1.2, yMax = 1.2;
 
     // Control Flags (volatile for thread safety)
-    private volatile boolean renderRequested = true; // Request initial render
+    private volatile boolean renderRequested = true;
     private volatile boolean shutdownRequested = false;
 
     // GUI and MPI Fields
@@ -21,12 +26,18 @@ public class MandelbrotViewer extends JFrame {
     private final int rank;
     private final int size;
 
+    // Command-line flags
+    private static boolean headlessMode = false;
+    private static boolean runTests = false;
+
     public MandelbrotViewer(int rank, int size) {
         this.rank = rank;
         this.size = size;
         if (rank == 0) {
             this.image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
-            initGUI();
+            if (!headlessMode && !runTests) {
+                initGUI();
+            }
         }
     }
 
@@ -46,7 +57,7 @@ public class MandelbrotViewer extends JFrame {
         addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent ev) {
-                if (renderingIsInProgress()) return; // Don't accept input during render
+                if (renderingIsInProgress()) return;
 
                 double panSpeed = 0.1 * (xMax - xMin);
                 switch (ev.getKeyCode()) {
@@ -56,6 +67,7 @@ public class MandelbrotViewer extends JFrame {
                     case KeyEvent.VK_DOWN:  yMin += panSpeed; yMax += panSpeed; break;
                     case KeyEvent.VK_1:     zoom(0.8); break;
                     case KeyEvent.VK_2:     zoom(1.25); break;
+                    case KeyEvent.VK_S:     saveImage(); return;
                     case KeyEvent.VK_Q:     requestShutdown(); return;
                 }
                 requestRender();
@@ -85,7 +97,6 @@ public class MandelbrotViewer extends JFrame {
         yMin = yCenter - yRange / 2; yMax = yCenter + yRange / 2;
     }
 
-    // Thread-safe methods for main thread to control state
     public synchronized void requestRender() { this.renderRequested = true; }
     public synchronized void requestShutdown() { this.shutdownRequested = true; }
     private synchronized boolean isRenderRequested() { return this.renderRequested; }
@@ -93,57 +104,30 @@ public class MandelbrotViewer extends JFrame {
     private synchronized boolean renderingIsInProgress() { return this.renderRequested; }
     private synchronized void setRenderDone() { this.renderRequested = false; }
 
-
-
     public void runMasterLoop() {
         while (!isShutdownRequested()) {
             if (isRenderRequested()) {
                 try {
-                    // MPI render process happens here
-                    System.out.printf("Master thread starting render for R:[%.4f, %.4f]\n", xMin, xMax);
+                    int[] allPixels = performDistributedRender();
 
-                    double[] params = new double[]{width, height, xMin, xMax, yMin, yMax};
-                    MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
-
-                    int rowsPerProc = height / size;
-                    int extraRows = height % size;
-                    int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
-                    int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
-                    int[] localPixels = computeSlice(width, height, xMin, xMax, yMin, yMax, yStart, yEnd);
-
-                    int[] recvCounts = new int[size];
-                    int[] displs = new int[size];
-                    int offset = 0;
-                    for (int i = 0; i < size; i++) {
-                        int rpp = height / size;
-                        int er = height % size;
-                        int startRow = i * rpp + Math.min(i, er);
-                        int endRow = startRow + rpp + (i < er ? 1 : 0);
-                        recvCounts[i] = (endRow - startRow) * width;
-                        displs[i] = offset;
-                        offset += recvCounts[i];
+                    if (!headlessMode && !runTests) {
+                        SwingUtilities.invokeLater(() -> {
+                            image.setRGB(0, 0, width, height, allPixels, 0, width);
+                            repaint();
+                            setRenderDone();
+                        });
+                    } else {
+                        setRenderDone();
                     }
-
-                    int[] allPixels = new int[width * height];
-                    MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT,
-                            allPixels, 0, recvCounts, displs, MPI.INT, 0);
-
-                    // --- Safely update the GUI on the EDT ---
-                    SwingUtilities.invokeLater(() -> {
-                        image.setRGB(0, 0, width, height, allPixels, 0, width);
-                        repaint();
-                        setRenderDone(); // Mark render as complete
-                    });
 
                 } catch (Exception e) {
                     e.printStackTrace();
                     setRenderDone();
                 }
             }
-            try { Thread.sleep(10); } catch (InterruptedException e) {} // Small sleep to prevent busy-waiting
+            try { Thread.sleep(10); } catch (InterruptedException e) {}
         }
 
-        // Shutdown sequence
         try {
             System.out.println("Master sending shutdown signal...");
             double[] quitSignal = new double[]{-1};
@@ -152,9 +136,41 @@ public class MandelbrotViewer extends JFrame {
             e.printStackTrace();
         }
 
-        dispose(); // Close the GUI window
+        if (!headlessMode && !runTests) {
+            dispose();
+        }
     }
 
+    private int[] performDistributedRender() throws MPIException {
+        System.out.printf("Master thread starting render for %dx%d image...\n", width, height);
+
+        double[] params = new double[]{width, height, xMin, xMax, yMin, yMax};
+        MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
+
+        int rowsPerProc = height / size;
+        int extraRows = height % size;
+        int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
+        int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
+        int[] localPixels = computeSlice(width, height, xMin, xMax, yMin, yMax, yStart, yEnd);
+
+        int[] recvCounts = new int[size];
+        int[] displs = new int[size];
+        int offset = 0;
+        for (int i = 0; i < size; i++) {
+            int rpp = height / size;
+            int er = height % size;
+            int startRow = i * rpp + Math.min(i, er);
+            int endRow = startRow + rpp + (i < er ? 1 : 0);
+            recvCounts[i] = (endRow - startRow) * width;
+            displs[i] = offset;
+            offset += recvCounts[i];
+        }
+
+        int[] allPixels = new int[width * height];
+        MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT, allPixels, 0, recvCounts, displs, MPI.INT, 0);
+
+        return allPixels;
+    }
 
     public void runWorkerLoop() {
         while (true) {
@@ -162,7 +178,7 @@ public class MandelbrotViewer extends JFrame {
                 double[] params = new double[6];
                 MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
 
-                if (params[0] < 0) { // Shutdown signal
+                if (params[0] < 0) {
                     System.out.println("Worker " + rank + " received shutdown. Exiting.");
                     break;
                 }
@@ -176,12 +192,65 @@ public class MandelbrotViewer extends JFrame {
                 int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
 
                 int[] localPixels = computeSlice(w, h, xm, xM, ym, yM, yStart, yEnd);
-
                 MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT, null, 0, null, null, MPI.INT, 0);
             } catch (MPIException e) {
                 e.printStackTrace();
                 break;
             }
+        }
+    }
+
+    private void saveImage() {
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setDialogTitle("Save Image");
+        fileChooser.setSelectedFile(new File("mandelbrot.png"));
+        int userSelection = fileChooser.showSaveDialog(this);
+
+        if (userSelection == JFileChooser.APPROVE_OPTION) {
+            File fileToSave = fileChooser.getSelectedFile();
+            new Thread(() -> {
+                try {
+                    ImageIO.write(image, "png", fileToSave);
+                    System.out.println("Image saved to " + fileToSave.getAbsolutePath());
+                } catch (IOException ex) {
+                    JOptionPane.showMessageDialog(this, "Error saving file: " + ex.getMessage(), "Save Error", JOptionPane.ERROR_MESSAGE);
+                }
+            }).start();
+        }
+    }
+
+
+    private void runPerformanceTests() {
+        int startSize = 1000;
+        int maxSize = 10000;
+        String csvFile = "mandelbrot_mpi_results.csv";
+
+        try (PrintWriter writer = new PrintWriter(new FileWriter(csvFile))) {
+            writer.println("width,height,render_time_ms");
+
+            for (int size = startSize; size <= maxSize; size += 1000) {
+                // viewer's dimensions for the test
+                this.width = size;
+                this.height = size;
+
+                // Start timer
+                long startTime = System.currentTimeMillis();
+
+                // Run blocking render operation
+                performDistributedRender();
+
+                // Stop timer
+                long endTime = System.currentTimeMillis();
+                long renderTime = endTime - startTime;
+
+                // Log console & write to file
+                System.out.println("STATUS: Test render " + size + "x" + size + " completed in " + renderTime + " ms");
+                writer.println(size + "," + size + "," + renderTime);
+            }
+            System.out.println("SUCCESS: Performance tests complete. Results saved to " + csvFile);
+        } catch (IOException | MPIException e) {
+            e.printStackTrace();
+            System.err.println("ERROR: Could not write to CSV file or MPI error during test.");
         }
     }
 
@@ -193,7 +262,6 @@ public class MandelbrotViewer extends JFrame {
         }
     }
 
-    // computation logic
     private static int[] computeSlice(int w, int h, double xm, double xM, double ym, double yM, int yStart, int yEnd) {
         if (yStart >= yEnd || w <= 0) return new int[0];
         int[] slicePixels = new int[(yEnd - yStart) * w];
@@ -220,28 +288,46 @@ public class MandelbrotViewer extends JFrame {
     }
 
     public static void main(String[] args) {
+        int rank = -1;
+
         try {
             MPI.Init(args);
-            int rank = MPI.COMM_WORLD.Rank();
+            rank = MPI.COMM_WORLD.Rank();
             int size = MPI.COMM_WORLD.Size();
 
-            if (rank == 0) {
-                // Master Process
-                MandelbrotViewer masterViewer = new MandelbrotViewer(rank, size);
-                SwingUtilities.invokeLater(() -> masterViewer.setVisible(true));
-                masterViewer.runMasterLoop(); // The main thread now enters the consumer loop
-
-            } else {
-                // Worker Process
-                MandelbrotViewer workerViewer = new MandelbrotViewer(rank, size);
-                workerViewer.runWorkerLoop();
+            for (String arg : args) {
+                if (arg.equalsIgnoreCase("--nongui")) headlessMode = true;
+                else if (arg.equalsIgnoreCase("--test")) runTests = true;
             }
 
-            MPI.Finalize(); // All processes will reach here upon graceful shutdown
-            System.out.println("Process " + rank + " finalized.");
+            MandelbrotViewer viewer = new MandelbrotViewer(rank, size);
 
+            if (rank == 0) {
+                if (headlessMode) {
+                    System.out.println("Running in headless (non-GUI    ) mode.");
+                    viewer.performDistributedRender();
+                    System.out.println("Headless render complete.");
+                    viewer.requestShutdown();
+                    viewer.runMasterLoop();
+                } else if (runTests) {
+                    System.out.println("Running performance tests with " + size + " processes...");
+                    viewer.runPerformanceTests(); // Call the test runner
+                    viewer.requestShutdown();
+                    viewer.runMasterLoop(); // Run loop to send shutdown signal
+                } else {
+                    SwingUtilities.invokeLater(() -> viewer.setVisible(true));
+                    viewer.runMasterLoop();
+                }
+            } else {
+                viewer.runWorkerLoop();
+            }
         } catch (MPIException e) {
             e.printStackTrace();
+        } finally {
+            try {
+                MPI.Finalize();
+                if(rank != -1) { System.out.println("Process " + rank + " finalized."); }
+            } catch (MPIException e) { e.printStackTrace(); }
         }
     }
 
