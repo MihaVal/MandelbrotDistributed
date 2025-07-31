@@ -21,59 +21,65 @@ public class MandelbrotViewer extends JFrame {
     private double zoomFactor = 0.8;
     private double panSpeed;
     private BufferedImage image;
-    private boolean rendering = false;
-    //type in command line when launching --nongui or --test to run either of them for testing
-    //if you want the set to just render normally with gui, then leave it as blank
-    private static boolean headlessMode = false; //nongui bool
-    private static boolean runTests = false; // test bool
+    private volatile boolean rendering = false; // volatile for thread safety
 
-    public MandelbrotViewer() {
-        if (!headlessMode) {
-            setTitle("Mandelbrot Set Window");
-            setSize(width, height);
-            setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-            setLocationRelativeTo(null);
-            setResizable(true);
+    // Command-line flags
+    private static boolean headlessMode = false;
+    private static boolean runTests = false;
 
-            addKeyListener(new KeyAdapter() {
-                @Override
-                public void keyPressed(KeyEvent e) {
-                    switch (e.getKeyCode()) {
-                        case KeyEvent.VK_LEFT: // Movements
-                            xMin -= panSpeed;
-                            xMax -= panSpeed;
-                            break;
-                        case KeyEvent.VK_RIGHT:
-                            xMin += panSpeed;
-                            xMax += panSpeed;
-                            break;
-                        case KeyEvent.VK_UP:
-                            yMin -= panSpeed;
-                            yMax -= panSpeed;
-                            break;
-                        case KeyEvent.VK_DOWN:
-                            yMin += panSpeed;
-                            yMax += panSpeed;
-                            break;
-                        case KeyEvent.VK_1: // Zoom in
-                            zoom(zoomFactor);
-                            break;
-                        case KeyEvent.VK_2: // Zoom out
-                            zoom(1 / zoomFactor);
-                            break;
-                        case KeyEvent.VK_S: // Save
-                            promptImageSize();
-                            saveImage();
-                            break;
-                    }
-                    startRendering();
-                }
-            });
+    // MPI specific fields
+    private final int rank;
+    private final int size;
+
+    public MandelbrotViewer(int rank, int size) {
+        this.rank = rank;
+        this.size = size;
+
+        // Only the master process (rank 0) initializes the GUI
+        if (rank == 0 && !headlessMode && !runTests) {
+            initGUI();
         }
 
         image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
-        panSpeed = 0.1 * (xMax - xMin);
+        updatePanSpeed();
 
+        // This is called by the master on startup
+        if (rank == 0) {
+            startRendering();
+        }
+    }
+
+    private void initGUI() {
+        setTitle("Mandelbrot-MPI Window (Master Rank 0)");
+        setSize(width, height);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE); // We handle closing to shutdown MPI
+        setLocationRelativeTo(null);
+        setResizable(true);
+
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                // This is the trigger for a graceful shutdown
+                shutdown();
+            }
+        });
+
+        addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent ev) {
+                switch (ev.getKeyCode()) {
+                    case KeyEvent.VK_LEFT:  xMin -= panSpeed; xMax -= panSpeed; break;
+                    case KeyEvent.VK_RIGHT: xMin += panSpeed; xMax += panSpeed; break;
+                    case KeyEvent.VK_UP:    yMin -= panSpeed; yMax -= panSpeed; break;
+                    case KeyEvent.VK_DOWN:  yMin += panSpeed; yMax += panSpeed; break;
+                    case KeyEvent.VK_1: zoom(zoomFactor); break;
+                    case KeyEvent.VK_2: zoom(1 / zoomFactor); break;
+                    case KeyEvent.VK_S: promptAndSaveImage(); break;
+                    case KeyEvent.VK_Q: shutdown(); break; // Explicit quit key
+                }
+                startRendering();
+            }
+        });
 
         addComponentListener(new ComponentAdapter() {
             @Override
@@ -83,19 +89,12 @@ public class MandelbrotViewer extends JFrame {
                 startRendering();
             }
         });
-
-        startRendering();
     }
 
-    private void promptImageSize() {
-        Scanner scanner = new Scanner(System.in);
-        Logger.log("Enter image width: ", LogLevel.Warn);
-        width = scanner.nextInt();
-        Logger.log("Enter image height: ", LogLevel.Warn);
-        height = scanner.nextInt();
-        setSize(width, height);
-        image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
-        startRendering();
+
+
+    private void updatePanSpeed() {
+        panSpeed = 0.1 * (xMax - xMin);
     }
 
     private void zoom(double factor) {
@@ -107,242 +106,228 @@ public class MandelbrotViewer extends JFrame {
         xMax = xCenter + xRange / 2;
         yMin = yCenter - yRange / 2;
         yMax = yCenter + yRange / 2;
-        panSpeed = 0.1 * (xMax - xMin); // Adjust the pan speed for diff zoom levels
+        updatePanSpeed();
     }
 
     private void startRendering() {
-        if (rendering) return;
+        if (rendering || rank != 0) return; // Only master initiates a render
 
         rendering = true;
+
+        // **CRITICAL FIX**: Run the blocking MPI render logic on a background thread.
+        // This prevents the GUI's Event Dispatch Thread (EDT) from freezing.
         new Thread(() -> {
-            renderMandelbrot();
+            renderMandelbrot(this.width, this.height);
             rendering = false;
-            if (!headlessMode) repaint();
+            if (!headlessMode && !runTests) {
+                // repaint() is thread-safe and will schedule a paint on the EDT.
+                repaint();
+            }
         }).start();
     }
 
-    private void renderMandelbrot() {
+    // Master's orchestration logic for a render of specific dimensions
+    private void renderMandelbrot(int renderWidth, int renderHeight) {
+        double[] params = new double[]{renderWidth, renderHeight, xMin, xMax, yMin, yMax};
         try {
-
-
-            int rank = MPI.COMM_WORLD.Rank();
-            int size = MPI.COMM_WORLD.Size();
-
-            image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
-            long start = System.currentTimeMillis();
-
-            // Divide the work: each process gets a chunk of rows
-            int rowsPerProc = height / size;
-            int extraRows = height % size;
-            int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
-            int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
-
-            // Each process computes its chunk
-            int[] localPixels = new int[(yEnd - yStart) * width];
-            int idx = 0;
-            for (int y = yStart; y < yEnd; y++) {
-                for (int x = 0; x < width; x++) {
-                    double real = xMin + x * (xMax - xMin) / width;
-                    double imag = yMin + y * (yMax - yMin) / height;
-                    int color = computePoint(new Complex(real, imag));
-                    localPixels[idx++] = color;
-                }
+            MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
+            BufferedImage resultImage = computeAndGather(renderWidth, renderHeight);
+            if (rank == 0) {
+                this.image = resultImage;
             }
+        } catch (MPIException e) {
+            e.printStackTrace();
+        }
+    }
 
-            // Gather all results at root (rank 0)
-            int[] recvCounts = new int[size];
-            int[] displs = new int[size];
+    // This method is run by ALL processes after receiving parameters.
+    private BufferedImage computeAndGather(int renderWidth, int renderHeight) throws MPIException {
+        long start = 0;
+        if (rank == 0) start = System.currentTimeMillis();
+
+        int rowsPerProc = renderHeight / size;
+        int extraRows = renderHeight % size;
+        int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
+        int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
+
+        int[] localPixels = new int[(yEnd - yStart) * renderWidth];
+        int idx = 0;
+        for (int y = yStart; y < yEnd; y++) {
+            for (int x = 0; x < renderWidth; x++) {
+                double real = xMin + x * (xMax - xMin) / renderWidth;
+                double imag = yMin + y * (yMax - yMin) / renderHeight;
+                localPixels[idx++] = computePoint(new Complex(real, imag));
+            }
+        }
+
+        int[] recvCounts = (rank == 0) ? new int[size] : null;
+        int[] displs = (rank == 0) ? new int[size] : null;
+
+        if (rank == 0) {
             int offset = 0;
             for (int i = 0; i < size; i++) {
                 int startRow = i * rowsPerProc + Math.min(i, extraRows);
                 int endRow = startRow + rowsPerProc + (i < extraRows ? 1 : 0);
-                recvCounts[i] = (endRow - startRow) * width;
+                recvCounts[i] = (endRow - startRow) * renderWidth;
                 displs[i] = offset;
                 offset += recvCounts[i];
             }
-
-            int[] allPixels = null;
-            if (rank == 0) {
-                allPixels = new int[width * height];
-            }
-
-            MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT,
-                    allPixels, 0, recvCounts, displs, MPI.INT, 0);
-
-            // Root process assembles the image
-            if (rank == 0) {
-                int pos = 0;
-                for (int i = 0; i < size; i++) {
-                    int startRow = i * rowsPerProc + Math.min(i, extraRows);
-                    int endRow = startRow + rowsPerProc + (i < extraRows ? 1 : 0);
-                    for (int y = startRow; y < endRow; y++) {
-                        for (int x = 0; x < width; x++) {
-                            image.setRGB(x, y, allPixels[pos++]);
-                        }
-                    }
-                }
-                long end = System.currentTimeMillis();
-                if (!headlessMode) {
-                    Logger.log("MPI Render time: " + (end - start) + " ms", LogLevel.Info);
-                }
-            }
-
-            // Finalize MPI if you want (optional, but don't do it if you plan to call renderMandelbrot again)
-            // MPI.Finalize();
-
-        } catch (Exception e) {
-            e.printStackTrace();
         }
+
+        int[] allPixels = (rank == 0) ? new int[renderWidth * renderHeight] : null;
+        MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT,
+                allPixels, 0, recvCounts, displs, MPI.INT, 0);
+
+        BufferedImage finalImage = null;
+        if (rank == 0) {
+            finalImage = new BufferedImage(renderWidth, renderHeight, BufferedImage.TYPE_INT_RGB);
+            finalImage.setRGB(0, 0, renderWidth, renderHeight, allPixels, 0, renderWidth);
+            long end = System.currentTimeMillis();
+            System.out.println("INFO: MPI Render (" + renderWidth + "x" + renderHeight + " on " + size + " procs): " + (end - start) + " ms");
+        }
+        return finalImage;
     }
 
     private int computePoint(Complex c) {
         Complex z = new Complex(0, 0);
         int n = 0;
-
         while (z.abs() <= 2 && n < MAX_ITER) {
             z = z.multiply(z).add(c);
             n++;
         }
-
-        if (n == MAX_ITER) {
-            return Color.BLACK.getRGB(); // black for inside of the set
-        }
-
-        // color gradient
-        float hue = 0.7f + (float) n / MAX_ITER;
-        float saturation = 1.0f;
-        float brightness = n < MAX_ITER ? 1.0f : 0.0f;
-        return Color.HSBtoRGB(hue, saturation, brightness);
-    }
-
-    private void saveImage() {
-        try {
-            renderMandelbrot(); //render before new size chosen by the user fix
-            File outputfile = new File("mandelbrot.png");
-            ImageIO.write(image, "png", outputfile);
-            Logger.log("Image saved to " + outputfile.getAbsolutePath(), LogLevel.Success);
-        } catch (IOException e) {
-            e.printStackTrace();
-            Logger.log("Failed to save the image.", LogLevel.Error);
-        }
+        if (n == MAX_ITER) return Color.BLACK.getRGB();
+        return Color.HSBtoRGB(0.7f + (float) n / MAX_ITER, 1.0f, 1.0f);
     }
 
     @Override
     public void paint(Graphics g) {
-        long frameStartTime = System.currentTimeMillis();
+        // The super.paint() is important to clear the panel before drawing
         super.paint(g);
-        g.drawImage(image, 0, 0, null);
-        long frameEndTime = System.currentTimeMillis();
+        if (rank == 0) {
+            g.drawImage(image, 0, 0, this);
+        }
+    }
 
-        // Limit to 60 FPS
-        long frameDuration = frameEndTime - frameStartTime;
-        long targetFrameDuration = 1000 / TARGET_FPS;
-        if (frameDuration < targetFrameDuration) {
+    // This method initiates the graceful shutdown of all MPI processes.
+    private void shutdown() {
+        if (rank == 0) {
+            System.out.println("INFO: Master sending shutdown signal...");
+            double[] quitSignal = new double[]{-1.0, 0, 0, 0, 0, 0};
             try {
-                Thread.sleep(targetFrameDuration - frameDuration);
-            } catch (InterruptedException e) {
+                // Tell workers to exit their loops
+                MPI.COMM_WORLD.Bcast(quitSignal, 0, 6, MPI.DOUBLE, 0);
+            } catch (MPIException e) {
                 e.printStackTrace();
+            }
+            dispose(); // Close the GUI window
+        }
+    }
+
+    // Main loop for worker processes (ranks > 0).
+    public void runWorker() {
+        if (rank == 0) return;
+
+        while (true) {
+            try {
+                double[] params = new double[6];
+                MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
+
+                if (params[0] < 0) { // Check for the shutdown signal
+                    System.out.println("INFO: Worker " + rank + " received shutdown signal. Exiting loop.");
+                    break;
+                }
+
+                int renderWidth = (int) params[0];
+                int renderHeight = (int) params[1];
+                this.xMin = params[2];
+                this.xMax = params[3];
+                this.yMin = params[4];
+                this.yMax = params[5];
+
+                computeAndGather(renderWidth, renderHeight);
+            } catch (MPIException e) {
+                e.printStackTrace();
+                break;
             }
         }
     }
 
-    private static void runPerformanceTests() {
+    // In MandelbrotViewer class
+
+    private static void runPerformanceTests(MandelbrotViewer viewer) {
         int startSize = 1000;
-        int maxSize = 5000;
-        String csvFile = "mandelbrot_results.csv";
+        int maxSize = 10000;
+        String csvFile = "mandelbrot_mpi_results.csv";
 
         try (PrintWriter writer = new PrintWriter(new FileWriter(csvFile))) {
-            writer.println("width,height,sequential");
+            writer.println("width,height,distributed");
 
             for (int size = startSize; size <= maxSize; size += 1000) {
-                MandelbrotViewer viewer = new MandelbrotViewer();
-                viewer.width = size;
-                viewer.height = size;
+                // Start the timer
                 long startTime = System.currentTimeMillis();
-                viewer.renderMandelbrot();
+
+                // Run the blocking render operation
+                viewer.renderMandelbrot(size, size);
+
+                // Stop the timer
                 long endTime = System.currentTimeMillis();
                 long renderTime = endTime - startTime;
 
-                Logger.log("Rendered " + size + "x" + size + " in " + renderTime + " ms", LogLevel.Status);
+                // Log to console and write to file
+                System.out.println("STATUS: Test render " + size + "x" + size + " completed in " + renderTime + " ms");
                 writer.println(size + "," + size + "," + renderTime);
             }
+            System.out.println("SUCCESS: Performance tests complete. Results saved to " + csvFile);
         } catch (IOException e) {
             e.printStackTrace();
-            Logger.log("Error writing CSV file.", LogLevel.Error);
+            System.err.println("ERROR: Could not write to CSV file.");
         }
     }
 
-    public static void main(String[] args) {
-        try {
-            MPI.Init(args);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
+    public static void main(String[] args) throws MPIException {
+        MPI.Init(args);
         int rank = MPI.COMM_WORLD.Rank();
+        int size = MPI.COMM_WORLD.Size();
 
         for (String arg : args) {
-            if (arg.equalsIgnoreCase("--nongui")) {
-                headlessMode = true;
-            } else if (arg.equalsIgnoreCase("--test")) {
-                runTests = true;
-            }
+            if (arg.equalsIgnoreCase("--nongui")) headlessMode = true;
+            else if (arg.equalsIgnoreCase("--test")) runTests = true;
         }
 
-        if (headlessMode) {
-            long startTime = System.currentTimeMillis();
-            MandelbrotViewer viewer = new MandelbrotViewer();
-            viewer.renderMandelbrot();
-            long endTime = System.currentTimeMillis();
-            Logger.log("Non-GUI speed: " + (endTime - startTime) + " ms", LogLevel.Status);
-            try { MPI.Finalize(); } catch (Exception e) { e.printStackTrace(); }
-            System.exit(0);
-        }
+        MandelbrotViewer viewer = new MandelbrotViewer(rank, size);
 
-        if (runTests) {
-            if (rank == 0) {
-                runPerformanceTests();
-                Logger.log("Performance tests completed. Results saved to mandelbrot_results.csv", LogLevel.Status);
-            }
-            try { MPI.Finalize(); } catch (Exception e) { e.printStackTrace(); }
-            System.exit(0);
-        } else {
-            if (rank == 0) {
-                MandelbrotViewer viewer = new MandelbrotViewer();
-                viewer.setVisible(true);
+        if (rank == 0) {
+            // --- MASTER (Rank 0) LOGIC ---
+            if (runTests) {
+                runPerformanceTests(viewer);
+                viewer.shutdown();
+            } else if (headlessMode) {
+                // The main thread will block here until the background render is done.
+                // We need a way to wait. A simple but crude way:
+                while(viewer.rendering) { try { Thread.sleep(100); } catch(InterruptedException e){} }
+                viewer.shutdown();
             } else {
-                // Other ranks must still participate in computation!
-                // They should create a MandelbrotViewer and call renderMandelbrot(), but NOT show a window.
-                MandelbrotViewer viewer = new MandelbrotViewer();
-                viewer.renderMandelbrot();
+                // GUI Mode: Let the Event Dispatch Thread manage the application's life.
+                // The master's main thread will proceed to MPI.Finalize() and block there,
+                // waiting for workers. This is the correct behavior.
+                SwingUtilities.invokeLater(() -> viewer.setVisible(true));
             }
+        } else {
+            // --- WORKER (Rank > 0) LOGIC ---
+            viewer.runWorker(); // This blocks until a shutdown signal is received.
         }
 
-        try { MPI.Finalize(); } catch (Exception e) { e.printStackTrace(); }
+        // All processes will reach here eventually.
+        // Master blocks here until workers are done. Workers block until they get a quit signal.
+        MPI.Finalize();
     }
 
+    // Unchanged Complex class
     static class Complex {
-        private final double real;
-        private final double imag;
-
-        public Complex(double real, double imag) {
-            this.real = real;
-            this.imag = imag;
-        }
-
-        public Complex add(Complex other) {
-            return new Complex(this.real + other.real, this.imag + other.imag);
-        }
-
-        public Complex multiply(Complex other) {
-            return new Complex(
-                    this.real * other.real - this.imag * other.imag,
-                    this.real * other.imag + this.imag * other.real
-            );
-        }
-
-        public double abs() {
-            return Math.sqrt(real * real + imag * imag);
-        }
+        private final double real, imag;
+        public Complex(double real, double imag) { this.real = real; this.imag = imag; }
+        public Complex add(Complex other) { return new Complex(this.real + other.real, this.imag + other.imag); }
+        public Complex multiply(Complex other) { return new Complex(this.real * other.real - this.imag * other.imag, this.real * other.imag + this.imag * other.real); }
+        public double abs() { return Math.sqrt(real * real + imag * imag); }
     }
 }
