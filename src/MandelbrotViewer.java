@@ -2,99 +2,78 @@ import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.util.Scanner;
-import javax.imageio.ImageIO;
 import mpi.*;
 
 public class MandelbrotViewer extends JFrame {
+    // State Fields
     private int width = 800;
     private int height = 600;
-    private static final int MAX_ITER = 100;
-    private static final int TARGET_FPS = 60;
-
+    private static final int MAX_ITER = 250;
     private double xMin = -2.0, xMax = 1.0;
     private double yMin = -1.2, yMax = 1.2;
-    private double zoomFactor = 0.8;
-    private double panSpeed;
+
+    // Control Flags (volatile for thread safety)
+    private volatile boolean renderRequested = true; // Request initial render
+    private volatile boolean shutdownRequested = false;
+
+    // GUI and MPI Fields
     private BufferedImage image;
-    private volatile boolean rendering = false; // volatile for thread safety
-
-    // Command-line flags
-    private static boolean headlessMode = false;
-    private static boolean runTests = false;
-
-    // MPI specific fields
     private final int rank;
     private final int size;
 
     public MandelbrotViewer(int rank, int size) {
         this.rank = rank;
         this.size = size;
-
-        // Only the master process (rank 0) initializes the GUI
-        if (rank == 0 && !headlessMode && !runTests) {
-            initGUI();
-        }
-
-        image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
-        updatePanSpeed();
-
-        // This is called by the master on startup
         if (rank == 0) {
-            startRendering();
+            this.image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+            initGUI();
         }
     }
 
     private void initGUI() {
-        setTitle("Mandelbrot-MPI Window (Master Rank 0)");
+        setTitle("Mandelbrot MPI Viewer (Master)");
         setSize(width, height);
-        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE); // We handle closing to shutdown MPI
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setLocationRelativeTo(null);
-        setResizable(true);
 
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
-                // This is the trigger for a graceful shutdown
-                shutdown();
+                requestShutdown();
             }
         });
 
         addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent ev) {
+                if (renderingIsInProgress()) return; // Don't accept input during render
+
+                double panSpeed = 0.1 * (xMax - xMin);
                 switch (ev.getKeyCode()) {
                     case KeyEvent.VK_LEFT:  xMin -= panSpeed; xMax -= panSpeed; break;
                     case KeyEvent.VK_RIGHT: xMin += panSpeed; xMax += panSpeed; break;
                     case KeyEvent.VK_UP:    yMin -= panSpeed; yMax -= panSpeed; break;
                     case KeyEvent.VK_DOWN:  yMin += panSpeed; yMax += panSpeed; break;
-                    case KeyEvent.VK_1: zoom(zoomFactor); break;
-                    case KeyEvent.VK_2: zoom(1 / zoomFactor); break;
-                    case KeyEvent.VK_S: promptAndSaveImage(); break;
-                    case KeyEvent.VK_Q: shutdown(); break; // Explicit quit key
+                    case KeyEvent.VK_1:     zoom(0.8); break;
+                    case KeyEvent.VK_2:     zoom(1.25); break;
+                    case KeyEvent.VK_Q:     requestShutdown(); return;
                 }
-                startRendering();
+                requestRender();
             }
         });
 
         addComponentListener(new ComponentAdapter() {
             @Override
             public void componentResized(ComponentEvent e) {
+                if (renderingIsInProgress()) return;
                 width = getWidth();
                 height = getHeight();
-                startRendering();
+                if (width > 0 && height > 0) {
+                    image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+                    requestRender();
+                }
             }
         });
-    }
-
-
-
-    private void updatePanSpeed() {
-        panSpeed = 0.1 * (xMax - xMin);
     }
 
     private void zoom(double factor) {
@@ -102,149 +81,103 @@ public class MandelbrotViewer extends JFrame {
         double yCenter = (yMin + yMax) / 2;
         double xRange = (xMax - xMin) * factor;
         double yRange = (yMax - yMin) * factor;
-        xMin = xCenter - xRange / 2;
-        xMax = xCenter + xRange / 2;
-        yMin = yCenter - yRange / 2;
-        yMax = yCenter + yRange / 2;
-        updatePanSpeed();
+        xMin = xCenter - xRange / 2; xMax = xCenter + xRange / 2;
+        yMin = yCenter - yRange / 2; yMax = yCenter + yRange / 2;
     }
 
-    private void startRendering() {
-        if (rendering || rank != 0) return; // Only master initiates a render
+    // Thread-safe methods for main thread to control state
+    public synchronized void requestRender() { this.renderRequested = true; }
+    public synchronized void requestShutdown() { this.shutdownRequested = true; }
+    private synchronized boolean isRenderRequested() { return this.renderRequested; }
+    private synchronized boolean isShutdownRequested() { return this.shutdownRequested; }
+    private synchronized boolean renderingIsInProgress() { return this.renderRequested; }
+    private synchronized void setRenderDone() { this.renderRequested = false; }
 
-        rendering = true;
 
-        // **CRITICAL FIX**: Run the blocking MPI render logic on a background thread.
-        // This prevents the GUI's Event Dispatch Thread (EDT) from freezing.
-        new Thread(() -> {
-            renderMandelbrot(this.width, this.height);
-            rendering = false;
-            if (!headlessMode && !runTests) {
-                // repaint() is thread-safe and will schedule a paint on the EDT.
-                repaint();
+
+    public void runMasterLoop() {
+        while (!isShutdownRequested()) {
+            if (isRenderRequested()) {
+                try {
+                    // MPI render process happens here
+                    System.out.printf("Master thread starting render for R:[%.4f, %.4f]\n", xMin, xMax);
+
+                    double[] params = new double[]{width, height, xMin, xMax, yMin, yMax};
+                    MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
+
+                    int rowsPerProc = height / size;
+                    int extraRows = height % size;
+                    int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
+                    int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
+                    int[] localPixels = computeSlice(width, height, xMin, xMax, yMin, yMax, yStart, yEnd);
+
+                    int[] recvCounts = new int[size];
+                    int[] displs = new int[size];
+                    int offset = 0;
+                    for (int i = 0; i < size; i++) {
+                        int rpp = height / size;
+                        int er = height % size;
+                        int startRow = i * rpp + Math.min(i, er);
+                        int endRow = startRow + rpp + (i < er ? 1 : 0);
+                        recvCounts[i] = (endRow - startRow) * width;
+                        displs[i] = offset;
+                        offset += recvCounts[i];
+                    }
+
+                    int[] allPixels = new int[width * height];
+                    MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT,
+                            allPixels, 0, recvCounts, displs, MPI.INT, 0);
+
+                    // --- Safely update the GUI on the EDT ---
+                    SwingUtilities.invokeLater(() -> {
+                        image.setRGB(0, 0, width, height, allPixels, 0, width);
+                        repaint();
+                        setRenderDone(); // Mark render as complete
+                    });
+
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    setRenderDone();
+                }
             }
-        }).start();
-    }
+            try { Thread.sleep(10); } catch (InterruptedException e) {} // Small sleep to prevent busy-waiting
+        }
 
-    // Master's orchestration logic for a render of specific dimensions
-    private void renderMandelbrot(int renderWidth, int renderHeight) {
-        double[] params = new double[]{renderWidth, renderHeight, xMin, xMax, yMin, yMax};
+        // Shutdown sequence
         try {
-            MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
-            BufferedImage resultImage = computeAndGather(renderWidth, renderHeight);
-            if (rank == 0) {
-                this.image = resultImage;
-            }
-        } catch (MPIException e) {
+            System.out.println("Master sending shutdown signal...");
+            double[] quitSignal = new double[]{-1};
+            MPI.COMM_WORLD.Bcast(quitSignal, 0, 1, MPI.DOUBLE, 0);
+        } catch(MPIException e) {
             e.printStackTrace();
         }
+
+        dispose(); // Close the GUI window
     }
 
-    // This method is run by ALL processes after receiving parameters.
-    private BufferedImage computeAndGather(int renderWidth, int renderHeight) throws MPIException {
-        long start = 0;
-        if (rank == 0) start = System.currentTimeMillis();
 
-        int rowsPerProc = renderHeight / size;
-        int extraRows = renderHeight % size;
-        int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
-        int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
-
-        int[] localPixels = new int[(yEnd - yStart) * renderWidth];
-        int idx = 0;
-        for (int y = yStart; y < yEnd; y++) {
-            for (int x = 0; x < renderWidth; x++) {
-                double real = xMin + x * (xMax - xMin) / renderWidth;
-                double imag = yMin + y * (yMax - yMin) / renderHeight;
-                localPixels[idx++] = computePoint(new Complex(real, imag));
-            }
-        }
-
-        int[] recvCounts = (rank == 0) ? new int[size] : null;
-        int[] displs = (rank == 0) ? new int[size] : null;
-
-        if (rank == 0) {
-            int offset = 0;
-            for (int i = 0; i < size; i++) {
-                int startRow = i * rowsPerProc + Math.min(i, extraRows);
-                int endRow = startRow + rowsPerProc + (i < extraRows ? 1 : 0);
-                recvCounts[i] = (endRow - startRow) * renderWidth;
-                displs[i] = offset;
-                offset += recvCounts[i];
-            }
-        }
-
-        int[] allPixels = (rank == 0) ? new int[renderWidth * renderHeight] : null;
-        MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT,
-                allPixels, 0, recvCounts, displs, MPI.INT, 0);
-
-        BufferedImage finalImage = null;
-        if (rank == 0) {
-            finalImage = new BufferedImage(renderWidth, renderHeight, BufferedImage.TYPE_INT_RGB);
-            finalImage.setRGB(0, 0, renderWidth, renderHeight, allPixels, 0, renderWidth);
-            long end = System.currentTimeMillis();
-            System.out.println("INFO: MPI Render (" + renderWidth + "x" + renderHeight + " on " + size + " procs): " + (end - start) + " ms");
-        }
-        return finalImage;
-    }
-
-    private int computePoint(Complex c) {
-        Complex z = new Complex(0, 0);
-        int n = 0;
-        while (z.abs() <= 2 && n < MAX_ITER) {
-            z = z.multiply(z).add(c);
-            n++;
-        }
-        if (n == MAX_ITER) return Color.BLACK.getRGB();
-        return Color.HSBtoRGB(0.7f + (float) n / MAX_ITER, 1.0f, 1.0f);
-    }
-
-    @Override
-    public void paint(Graphics g) {
-        // The super.paint() is important to clear the panel before drawing
-        super.paint(g);
-        if (rank == 0) {
-            g.drawImage(image, 0, 0, this);
-        }
-    }
-
-    // This method initiates the graceful shutdown of all MPI processes.
-    private void shutdown() {
-        if (rank == 0) {
-            System.out.println("INFO: Master sending shutdown signal...");
-            double[] quitSignal = new double[]{-1.0, 0, 0, 0, 0, 0};
-            try {
-                // Tell workers to exit their loops
-                MPI.COMM_WORLD.Bcast(quitSignal, 0, 6, MPI.DOUBLE, 0);
-            } catch (MPIException e) {
-                e.printStackTrace();
-            }
-            dispose(); // Close the GUI window
-        }
-    }
-
-    // Main loop for worker processes (ranks > 0).
-    public void runWorker() {
-        if (rank == 0) return;
-
+    public void runWorkerLoop() {
         while (true) {
             try {
                 double[] params = new double[6];
                 MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);
 
-                if (params[0] < 0) { // Check for the shutdown signal
-                    System.out.println("INFO: Worker " + rank + " received shutdown signal. Exiting loop.");
+                if (params[0] < 0) { // Shutdown signal
+                    System.out.println("Worker " + rank + " received shutdown. Exiting.");
                     break;
                 }
 
-                int renderWidth = (int) params[0];
-                int renderHeight = (int) params[1];
-                this.xMin = params[2];
-                this.xMax = params[3];
-                this.yMin = params[4];
-                this.yMax = params[5];
+                int w = (int) params[0], h = (int) params[1];
+                double xm = params[2], xM = params[3], ym = params[4], yM = params[5];
 
-                computeAndGather(renderWidth, renderHeight);
+                int rowsPerProc = h / size;
+                int extraRows = h % size;
+                int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
+                int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
+
+                int[] localPixels = computeSlice(w, h, xm, xM, ym, yM, yStart, yEnd);
+
+                MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT, null, 0, null, null, MPI.INT, 0);
             } catch (MPIException e) {
                 e.printStackTrace();
                 break;
@@ -252,82 +185,71 @@ public class MandelbrotViewer extends JFrame {
         }
     }
 
-    // In MandelbrotViewer class
-
-    private static void runPerformanceTests(MandelbrotViewer viewer) {
-        int startSize = 1000;
-        int maxSize = 10000;
-        String csvFile = "mandelbrot_mpi_results.csv";
-
-        try (PrintWriter writer = new PrintWriter(new FileWriter(csvFile))) {
-            writer.println("width,height,distributed");
-
-            for (int size = startSize; size <= maxSize; size += 1000) {
-                // Start the timer
-                long startTime = System.currentTimeMillis();
-
-                // Run the blocking render operation
-                viewer.renderMandelbrot(size, size);
-
-                // Stop the timer
-                long endTime = System.currentTimeMillis();
-                long renderTime = endTime - startTime;
-
-                // Log to console and write to file
-                System.out.println("STATUS: Test render " + size + "x" + size + " completed in " + renderTime + " ms");
-                writer.println(size + "," + size + "," + renderTime);
-            }
-            System.out.println("SUCCESS: Performance tests complete. Results saved to " + csvFile);
-        } catch (IOException e) {
-            e.printStackTrace();
-            System.err.println("ERROR: Could not write to CSV file.");
+    @Override
+    public void paint(Graphics g) {
+        super.paint(g);
+        if (image != null) {
+            g.drawImage(image, 0, 0, getWidth(), getHeight(), null);
         }
     }
 
-    public static void main(String[] args) throws MPIException {
-        MPI.Init(args);
-        int rank = MPI.COMM_WORLD.Rank();
-        int size = MPI.COMM_WORLD.Size();
-
-        for (String arg : args) {
-            if (arg.equalsIgnoreCase("--nongui")) headlessMode = true;
-            else if (arg.equalsIgnoreCase("--test")) runTests = true;
+    // computation logic
+    private static int[] computeSlice(int w, int h, double xm, double xM, double ym, double yM, int yStart, int yEnd) {
+        if (yStart >= yEnd || w <= 0) return new int[0];
+        int[] slicePixels = new int[(yEnd - yStart) * w];
+        int idx = 0;
+        for (int y = yStart; y < yEnd; y++) {
+            for (int x = 0; x < w; x++) {
+                double real = xm + x * (xM - xm) / (w - 1);
+                double imag = ym + y * (yM - ym) / (h - 1);
+                Complex c = new Complex(real, imag);
+                Complex z = new Complex(0, 0);
+                int n = 0;
+                while (z.absSq() <= 4.0 && n < MAX_ITER) {
+                    z = z.multiply(z).add(c);
+                    n++;
+                }
+                if (n == MAX_ITER) {
+                    slicePixels[idx++] = Color.BLACK.getRGB();
+                } else {
+                    slicePixels[idx++] = Color.getHSBColor(0.7f + (float) n / MAX_ITER, 1.0f, 1.0f).getRGB();
+                }
+            }
         }
+        return slicePixels;
+    }
 
-        MandelbrotViewer viewer = new MandelbrotViewer(rank, size);
+    public static void main(String[] args) {
+        try {
+            MPI.Init(args);
+            int rank = MPI.COMM_WORLD.Rank();
+            int size = MPI.COMM_WORLD.Size();
 
-        if (rank == 0) {
-            // --- MASTER (Rank 0) LOGIC ---
-            if (runTests) {
-                runPerformanceTests(viewer);
-                viewer.shutdown();
-            } else if (headlessMode) {
-                // The main thread will block here until the background render is done.
-                // We need a way to wait. A simple but crude way:
-                while(viewer.rendering) { try { Thread.sleep(100); } catch(InterruptedException e){} }
-                viewer.shutdown();
+            if (rank == 0) {
+                // Master Process
+                MandelbrotViewer masterViewer = new MandelbrotViewer(rank, size);
+                SwingUtilities.invokeLater(() -> masterViewer.setVisible(true));
+                masterViewer.runMasterLoop(); // The main thread now enters the consumer loop
+
             } else {
-                // GUI Mode: Let the Event Dispatch Thread manage the application's life.
-                // The master's main thread will proceed to MPI.Finalize() and block there,
-                // waiting for workers. This is the correct behavior.
-                SwingUtilities.invokeLater(() -> viewer.setVisible(true));
+                // Worker Process
+                MandelbrotViewer workerViewer = new MandelbrotViewer(rank, size);
+                workerViewer.runWorkerLoop();
             }
-        } else {
-            // --- WORKER (Rank > 0) LOGIC ---
-            viewer.runWorker(); // This blocks until a shutdown signal is received.
-        }
 
-        // All processes will reach here eventually.
-        // Master blocks here until workers are done. Workers block until they get a quit signal.
-        MPI.Finalize();
+            MPI.Finalize(); // All processes will reach here upon graceful shutdown
+            System.out.println("Process " + rank + " finalized.");
+
+        } catch (MPIException e) {
+            e.printStackTrace();
+        }
     }
 
-    // Unchanged Complex class
     static class Complex {
         private final double real, imag;
-        public Complex(double real, double imag) { this.real = real; this.imag = imag; }
-        public Complex add(Complex other) { return new Complex(this.real + other.real, this.imag + other.imag); }
-        public Complex multiply(Complex other) { return new Complex(this.real * other.real - this.imag * other.imag, this.real * other.imag + this.imag * other.real); }
-        public double abs() { return Math.sqrt(real * real + imag * imag); }
+        public Complex(double r, double i) { real = r; imag = i; }
+        public Complex add(Complex o) { return new Complex(real + o.real, imag + o.imag); }
+        public Complex multiply(Complex o) { return new Complex(real * o.real - imag * o.imag, real * o.imag + imag * o.real); }
+        public double absSq() { return real * real + imag * imag; }
     }
 }
