@@ -122,18 +122,77 @@ public class MandelbrotViewer extends JFrame {
     }
 
     private void renderMandelbrot() {
-        image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
-        long start = System.currentTimeMillis();
-        for (int x = 0; x < width; x++) {
-            for (int y = 0; y < height; y++) {
-                double real = xMin + x * (xMax - xMin) / width;
-                double imag = yMin + y * (yMax - yMin) / height;
-                int color = computePoint(new Complex(real, imag));
-                image.setRGB(x, y, color);
+        try {
+
+
+            int rank = MPI.COMM_WORLD.Rank();
+            int size = MPI.COMM_WORLD.Size();
+
+            image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+            long start = System.currentTimeMillis();
+
+            // Divide the work: each process gets a chunk of rows
+            int rowsPerProc = height / size;
+            int extraRows = height % size;
+            int yStart = rank * rowsPerProc + Math.min(rank, extraRows);
+            int yEnd = yStart + rowsPerProc + (rank < extraRows ? 1 : 0);
+
+            // Each process computes its chunk
+            int[] localPixels = new int[(yEnd - yStart) * width];
+            int idx = 0;
+            for (int y = yStart; y < yEnd; y++) {
+                for (int x = 0; x < width; x++) {
+                    double real = xMin + x * (xMax - xMin) / width;
+                    double imag = yMin + y * (yMax - yMin) / height;
+                    int color = computePoint(new Complex(real, imag));
+                    localPixels[idx++] = color;
+                }
             }
+
+            // Gather all results at root (rank 0)
+            int[] recvCounts = new int[size];
+            int[] displs = new int[size];
+            int offset = 0;
+            for (int i = 0; i < size; i++) {
+                int startRow = i * rowsPerProc + Math.min(i, extraRows);
+                int endRow = startRow + rowsPerProc + (i < extraRows ? 1 : 0);
+                recvCounts[i] = (endRow - startRow) * width;
+                displs[i] = offset;
+                offset += recvCounts[i];
+            }
+
+            int[] allPixels = null;
+            if (rank == 0) {
+                allPixels = new int[width * height];
+            }
+
+            MPI.COMM_WORLD.Gatherv(localPixels, 0, localPixels.length, MPI.INT,
+                    allPixels, 0, recvCounts, displs, MPI.INT, 0);
+
+            // Root process assembles the image
+            if (rank == 0) {
+                int pos = 0;
+                for (int i = 0; i < size; i++) {
+                    int startRow = i * rowsPerProc + Math.min(i, extraRows);
+                    int endRow = startRow + rowsPerProc + (i < extraRows ? 1 : 0);
+                    for (int y = startRow; y < endRow; y++) {
+                        for (int x = 0; x < width; x++) {
+                            image.setRGB(x, y, allPixels[pos++]);
+                        }
+                    }
+                }
+                long end = System.currentTimeMillis();
+                if (!headlessMode) {
+                    Logger.log("MPI Render time: " + (end - start) + " ms", LogLevel.Info);
+                }
+            }
+
+            // Finalize MPI if you want (optional, but don't do it if you plan to call renderMandelbrot again)
+            // MPI.Finalize();
+
+        } catch (Exception e) {
+            e.printStackTrace();
         }
-        long end = System.currentTimeMillis();
-        Logger.log("Render time: " + (end - start) + " ms", LogLevel.Info);
     }
 
     private int computePoint(Complex c) {
@@ -214,37 +273,52 @@ public class MandelbrotViewer extends JFrame {
     }
 
     public static void main(String[] args) {
+        try {
+            MPI.Init(args);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
 
-        MPI.Init(args);
         int rank = MPI.COMM_WORLD.Rank();
-        int size = MPI.COMM_WORLD.Size();
 
-        SwingUtilities.invokeLater(() -> {
-            for (String arg : args) {
-                if (arg.equalsIgnoreCase("--nongui")) { //no gui render launch option
-                    headlessMode = true;
-                } else if (arg.equalsIgnoreCase("--test")) { //render testing option
-                    runTests = true;
-                }
+        for (String arg : args) {
+            if (arg.equalsIgnoreCase("--nongui")) {
+                headlessMode = true;
+            } else if (arg.equalsIgnoreCase("--test")) {
+                runTests = true;
             }
+        }
 
-            if (headlessMode) {//completely lost sem tle atm, rad bi no gui +only calculate exec time of that no popup
-                long startTime = System.currentTimeMillis();
-                MandelbrotViewer viewer = new MandelbrotViewer();
-                viewer.renderMandelbrot();
-                long endTime = System.currentTimeMillis();
-                Logger.log("Non-GUI speed: " + (endTime - startTime) + " ms", LogLevel.Status);
-            }
+        if (headlessMode) {
+            long startTime = System.currentTimeMillis();
+            MandelbrotViewer viewer = new MandelbrotViewer();
+            viewer.renderMandelbrot();
+            long endTime = System.currentTimeMillis();
+            Logger.log("Non-GUI speed: " + (endTime - startTime) + " ms", LogLevel.Status);
+            try { MPI.Finalize(); } catch (Exception e) { e.printStackTrace(); }
+            System.exit(0);
+        }
 
-            if (runTests) {
+        if (runTests) {
+            if (rank == 0) {
                 runPerformanceTests();
                 Logger.log("Performance tests completed. Results saved to mandelbrot_results.csv", LogLevel.Status);
-                System.exit(0); //the file will keep overwriting itself if run n times in a row
-            } else {
-                MandelbrotViewer viewer = new MandelbrotViewer();
-                viewer.setVisible(true); //some problem here with the nongui setting
             }
-        });
+            try { MPI.Finalize(); } catch (Exception e) { e.printStackTrace(); }
+            System.exit(0);
+        } else {
+            if (rank == 0) {
+                MandelbrotViewer viewer = new MandelbrotViewer();
+                viewer.setVisible(true);
+            } else {
+                // Other ranks must still participate in computation!
+                // They should create a MandelbrotViewer and call renderMandelbrot(), but NOT show a window.
+                MandelbrotViewer viewer = new MandelbrotViewer();
+                viewer.renderMandelbrot();
+            }
+        }
+
+        try { MPI.Finalize(); } catch (Exception e) { e.printStackTrace(); }
     }
 
     static class Complex {
