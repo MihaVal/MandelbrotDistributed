@@ -141,7 +141,7 @@ public class MandelbrotViewer extends JFrame {
     }
 
     private int[] performDistributedRender() throws MPIException {
-        System.out.printf("Rendering %dx%d image...\n", width, height);
+        System.out.println("Rendering " + width + "x" + height + " image...");
 
         double[] params = new double[]{width, height, xMin, xMax, yMin, yMax};
         MPI.COMM_WORLD.Bcast(params, 0, 6, MPI.DOUBLE, 0);

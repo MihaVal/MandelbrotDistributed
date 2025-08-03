@@ -15,4 +15,4 @@
 
 #### - Project Description -> https://e.famnit.upr.si/pluginfile.php/731447/mod_resource/content/1/Programiranje_3_Projekti-3.pdf
 #### - Code and knowledge from this year's practicals & lectures
-#### - Help from OpenAI's ChatGPT-4o model
+#### - Help from OpenAI's ChatGPT-4o and Google's Gemini 2.5 Pro
